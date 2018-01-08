@@ -34,7 +34,7 @@ The script will do its best to detect mitigations, including backported non-vani
 ### Ubuntu LTS (before official patches)
 
 ```
-$ sudo ./spectre-and-meltdown.sh
+$ sudo ./spectre-meltdown-checker.sh
 Spectre and Meltdown mitigation detection tool v0.16
 
 Checking for vulnerabilities against live running kernel Linux 4.4.0-104-generic #127-Ubuntu SMP Mon Dec 11 12:16:42 UTC 2017 x86_64
