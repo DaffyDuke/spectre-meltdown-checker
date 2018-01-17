@@ -8,24 +8,23 @@
 #
 # Stephane Lesimple
 #
-VERSION=0.27
+VERSION=0.31
 
-# Script configuration
 show_usage()
 {
 	cat <<EOF
 	Usage:
-		Live mode:    $0 [options] [--live]
-		Offline mode: $0 [options] [--kernel <vmlinux_file>] [--config <kernel_config>] [--map <kernel_map_file>]
+		Live mode:    `basename $0` [options] [--live]
+		Offline mode: `basename $0` [options] [--kernel <vmlinux_file>] [--config <kernel_config>] [--map <kernel_map_file>]
 
 	Modes:
 		Two modes are available.
 
 		First mode is the "live" mode (default), it does its best to find information about the currently running kernel.
-		To run under this mode, just start the script without any option (you can also use --live explicitely)
+		To run under this mode, just start the script without any option (you can also use --live explicitly)
 
 		Second mode is the "offline" mode, where you can inspect a non-running kernel.
-		You'll need to specify the location of the vmlinux file, and if possible, the corresponding config and System.map files:
+		You'll need to specify the location of the vmlinux file, config and System.map files:
 
 		--kernel vmlinux_file		Specify a (possibly compressed) vmlinux file
 		--config kernel_config		Specify a kernel config file
@@ -35,11 +34,15 @@ show_usage()
 		--no-color			Don't use color codes
 		--verbose, -v			Increase verbosity level
 		--no-sysfs			Don't use the /sys interface even if present
+		--coreos			Special mode for CoreOS (use an ephemeral toolbox to inspect kernel)
 		--batch text			Produce machine readable output, this is the default if --batch is specified alone
 		--batch json			Produce JSON output formatted for Puppet, Ansible, Chef...
 		--batch nrpe			Produce machine readable output formatted for NRPE
 		--variant [1,2,3]		Specify which variant you'd like to check, by default all variants are checked
 						Can be specified multiple times (e.g. --variant 2 --variant 3)
+
+	Return codes:
+		0 (not vulnerable), 2 (vulnerable), 3 (unknown), 255 (error)
 
 	IMPORTANT:
 	A false sense of security is worse than no security at all.
@@ -66,7 +69,7 @@ in which it runs.
 
 The nature of the discovered vulnerabilities being quite new, the landscape of vulnerable processors can be expected
 to change over time, which is why this script makes the assumption that all CPUs are vulnerable, except if the manufacturer
-explicitely stated otherwise in a verifiable public announcement.
+explicitly stated otherwise in a verifiable public announcement.
 
 This tool has been released in the hope that it'll be useful, but don't use it to jump to conclusions about your security.
 
@@ -88,9 +91,10 @@ opt_variant2=0
 opt_variant3=0
 opt_allvariants=1
 opt_no_sysfs=0
+opt_coreos=0
 
-nrpe_critical=0
-nrpe_unknown=0
+global_critical=0
+global_unknown=0
 nrpe_vuln=""
 
 __echo()
@@ -102,7 +106,7 @@ __echo()
 		# strip ANSI color codes
 		_msg=$(/bin/echo -e  "$_msg" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g")
 	fi
-	# explicitely call /bin/echo to avoid shell builtins that might not take options
+	# explicitly call /bin/echo to avoid shell builtins that might not take options
 	/bin/echo $opt -e "$_msg"
 }
 
@@ -142,23 +146,40 @@ _verbose()
 	_echo 2 "$@"
 }
 
+_verbose_nol()
+{
+	_echo_nol 2 "$@"
+}
+
 _debug()
 {
-	_echo 3 "(debug) $@"
+	_echo 3 "\033[34m(debug) $@\033[0m"
 }
 
 is_cpu_vulnerable()
 {
 	# param: 1, 2 or 3 (variant)
-	# returns 1 if vulnerable, 0 if not vulnerable, 255 on error
+	# returns 0 if vulnerable, 1 if not vulnerable
+	# (note that in shell, a return of 0 is success)
 	# by default, everything is vulnerable, we work in a "whitelist" logic here.
 	# usage: is_cpu_vulnerable 2 && do something if vulnerable
 	variant1=0
 	variant2=0
 	variant3=0
-	if grep -q AMD /proc/cpuinfo; then
-		variant1=0
-		variant2=1
+
+	if grep -q GenuineIntel /proc/cpuinfo; then
+		# Intel
+		# Old Atoms are not vulnerable to spectre 2 nor meltdown
+		# https://security-center.intel.com/advisory.aspx?intelid=INTEL-SA-00088&languageid=en-fr
+		# model name : Genuine Intel(R) CPU N270 @ 1.60GHz
+		# model name : Intel(R) Atom(TM) CPU 330 @ 1.60GHz
+		if grep -qE '^model name.+ Intel\(R\) (Atom\(TM\) CPU +(S|D|230|330)|CPU N[0-9]{3} )' /proc/cpuinfo; then
+			variant2=1
+			variant3=1
+		fi
+	elif grep -q AuthenticAMD /proc/cpuinfo; then
+		# AMD revised their statement about variant2 => vulnerable
+		# https://www.amd.com/en/corporate/speculative-execution
 		variant3=1
 	elif grep -qi 'CPU implementer\s*:\s*0x41' /proc/cpuinfo; then
 		# ARM
@@ -173,28 +194,27 @@ is_cpu_vulnerable()
 			# arch  7? 7? 7     7     7     8     8      8      8
 			if [ "$cpuarch" = 7 ] && echo "$cpupart" | grep -Eq '^0x(c09|c0f|c0e)$'; then
 				# armv7 vulnerable chips
-				variant1=0
-				variant2=0
+				:
 			elif [ "$cpuarch" = 8 ] && echo "$cpupart" | grep -Eq '^0x(d07|d08|d09|d0a)$'; then
 				# armv8 vulnerable chips
-				variant1=0
-				variant2=0
+				:
 			else
+				# others are not vulnerable
 				variant1=1
 				variant2=1
 			fi
 			# for variant3, only A75 is vulnerable
-			if [ "$cpuarch" = 8 -a "$cpupart" = 0xd0a ]; then
-				variant3=0
-			else
+			if ! [ "$cpuarch" = 8 -a "$cpupart" = 0xd0a ]; then
 				variant3=1
 			fi
 		fi
 	fi
+
 	[ "$1" = 1 ] && return $variant1
 	[ "$1" = 2 ] && return $variant2
 	[ "$1" = 3 ] && return $variant3
-	return 255
+	echo "$0: error: invalid variant '$1' passed to is_cpu_vulnerable()" >&2
+	exit 255
 }
 
 show_header()
@@ -233,17 +253,17 @@ parse_opt_file()
 while [ -n "$1" ]; do
 	if [ "$1" = "--kernel" ]; then
 		opt_kernel=$(parse_opt_file kernel "$2")
-		[ $? -ne 0 ] && exit $?
+		[ $? -ne 0 ] && exit 255
 		shift 2
 		opt_live=0
 	elif [ "$1" = "--config" ]; then
 		opt_config=$(parse_opt_file config "$2")
-		[ $? -ne 0 ] && exit $?
+		[ $? -ne 0 ] && exit 255
 		shift 2
 		opt_live=0
 	elif [ "$1" = "--map" ]; then
 		opt_map=$(parse_opt_file map "$2")
-		[ $? -ne 0 ] && exit $?
+		[ $? -ne 0 ] && exit 255
 		shift 2
 		opt_live=0
 	elif [ "$1" = "--live" ]; then
@@ -255,6 +275,13 @@ while [ -n "$1" ]; do
 	elif [ "$1" = "--no-sysfs" ]; then
 		opt_no_sysfs=1
 		shift
+	elif [ "$1" = "--coreos" ]; then
+		opt_coreos=1
+		shift
+	elif [ "$1" = "--coreos-within-toolbox" ]; then
+		# don't use directly: used internally by --coreos
+		opt_coreos=0
+		shift
 	elif [ "$1" = "--batch" ]; then
 		opt_batch=1
 		opt_verbose=0
@@ -264,9 +291,9 @@ while [ -n "$1" ]; do
 			--*) ;;    # allow subsequent flags
 			'') ;;     # allow nothing at all
 			*)
-				echo "$0: error: unknown batch format '$1'"
-				echo "$0: error: --batch expects a format from: text, nrpe, json"
-				exit 1 >&2
+				echo "$0: error: unknown batch format '$1'" >&2
+				echo "$0: error: --batch expects a format from: text, nrpe, json" >&2
+				exit 255
 				;;
 		esac
 	elif [ "$1" = "-v" -o "$1" = "--verbose" ]; then
@@ -275,7 +302,7 @@ while [ -n "$1" ]; do
 	elif [ "$1" = "--variant" ]; then
 		if [ -z "$2" ]; then
 			echo "$0: error: option --variant expects a parameter (1, 2 or 3)" >&2
-			exit 1
+			exit 255
 		fi
 		case "$2" in
 			1) opt_variant1=1; opt_allvariants=0;;
@@ -283,12 +310,17 @@ while [ -n "$1" ]; do
 			3) opt_variant3=1; opt_allvariants=0;;
 			*)
 				echo "$0: error: invalid parameter '$2' for --variant, expected either 1, 2 or 3" >&2;
-				exit 1;;
+				exit 255
+				;;
 		esac
 		shift 2
 	elif [ "$1" = "-h" -o "$1" = "--help" ]; then
 		show_header
 		show_usage
+		exit 0
+	elif [ "$1" = "--version" ]; then
+		opt_no_color=1
+		show_header
 		exit 0
 	elif [ "$1" = "--disclaimer" ]; then
 		show_header
@@ -298,7 +330,7 @@ while [ -n "$1" ]; do
 		show_header
 		show_usage
 		echo "$0: error: unknown option '$1'"
-		exit 1
+		exit 255
 	fi
 done
 
@@ -328,37 +360,40 @@ pstatus()
 pvulnstatus()
 {
 	if [ "$opt_batch" = 1 ]; then
-                case "$opt_batch_format" in
-                        text) _echo 0 "$1: $2 ($3)";;
-                        nrpe)
-                              case "$2" in
-                                       UKN) nrpe_unknown="1";;
-                                       VULN) nrpe_critical="1"; nrpe_vuln="$nrpe_vuln $1";;
-                              esac
-                              ;;
-                        json)
-                              case "$1" in
-                                       CVE-2017-5753) aka="SPECTRE VARIANT 1";;
-                                       CVE-2017-5715) aka="SPECTRE VARIANT 2";;
-                                       CVE-2017-5754) aka="MELTDOWN";;
-                              esac
-                              case "$2" in
-                                       UKN)  is_vuln="unknown";;
-                                       VULN) is_vuln="true";;
-                                       OK)   is_vuln="false";;
-                              esac
-                              json_output="${json_output:-[}{\"NAME\":\""$aka"\",\"CVE\":\""$1"\",\"VULNERABLE\":$is_vuln,\"INFOS\":\""$3"\"},"
-                              ;;
+		case "$opt_batch_format" in
+			text) _echo 0 "$1: $2 ($3)";;
+			json)
+				case "$1" in
+					CVE-2017-5753) aka="SPECTRE VARIANT 1";;
+					CVE-2017-5715) aka="SPECTRE VARIANT 2";;
+					CVE-2017-5754) aka="MELTDOWN";;
+				esac
+				case "$2" in
+					UNK)  is_vuln="null";;
+					VULN) is_vuln="true";;
+					OK)   is_vuln="false";;
+				esac
+				json_output="${json_output:-[}{\"NAME\":\""$aka"\",\"CVE\":\""$1"\",\"VULNERABLE\":$is_vuln,\"INFOS\":\""$3"\"},"
+				;;
+
+			nrpe)	[ "$2" = VULN ] && nrpe_vuln="$nrpe_vuln $1";;
 		esac
 	fi
 
-	_info_nol "> \033[46m\033[30mSTATUS:\033[0m "
+	# always fill global_* vars because we use that do decide the program exit code
+	case "$2" in
+		UNK)  global_unknown="1";;
+		VULN) global_critical="1";;
+	esac
+
+	# display info if we're not in quiet/batch mode
 	vulnstatus="$2"
 	shift 2
+	_info_nol "> \033[46m\033[30mSTATUS:\033[0m "
 	case "$vulnstatus" in
-		UNK) pstatus yellow UNKNOWN "$@";;
-		VULN) pstatus red 'VULNERABLE' "$@";;
-		OK) pstatus green 'NOT VULNERABLE' "$@";;
+		UNK)  pstatus yellow 'UNKNOWN'        "$@";;
+		VULN) pstatus red    'VULNERABLE'     "$@";;
+		OK)   pstatus green  'NOT VULNERABLE' "$@";;
 	esac
 }
 
@@ -439,12 +474,87 @@ extract_vmlinux()
 
 # end of extract-vmlinux functions
 
+mount_debugfs()
+{
+	if [ ! -e /sys/kernel/debug/sched_features ]; then
+		# try to mount the debugfs hierarchy ourselves and remember it to umount afterwards
+		mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null && mounted_debugfs=1
+	fi
+}
+
+umount_debugfs()
+{
+	if [ "$mounted_debugfs" = 1 ]; then
+		# umount debugfs if we did mount it ourselves
+		umount /sys/kernel/debug
+	fi
+}
+
+load_msr()
+{
+	modprobe msr 2>/dev/null && insmod_msr=1
+	_debug "attempted to load module msr, insmod_msr=$insmod_msr"
+}
+
+unload_msr()
+{
+	if [ "$insmod_msr" = 1 ]; then
+		# if we used modprobe ourselves, rmmod the module
+		rmmod msr 2>/dev/null
+		_debug "attempted to unload module msr, ret=$?"
+	fi
+}
+
+load_cpuid()
+{
+	modprobe cpuid 2>/dev/null && insmod_cpuid=1
+	_debug "attempted to load module cpuid, insmod_cpuid=$insmod_cpuid"
+}
+
+unload_cpuid()
+{
+	if [ "$insmod_cpuid" = 1 ]; then
+		# if we used modprobe ourselves, rmmod the module
+		rmmod cpuid 2>/dev/null
+		_debug "attempted to unload module cpuid, ret=$?"
+	fi
+}
+
+is_coreos()
+{
+	which coreos-install >/dev/null 2>&1 && which toolbox >/dev/null 2>&1 && return 0
+	return 1
+}
+
 # check for mode selection inconsistency
 if [ "$opt_live_explicit" = 1 ]; then
 	if [ -n "$opt_kernel" -o -n "$opt_config" -o -n "$opt_map" ]; then
 		show_usage
-		echo "$0: error: incompatible modes specified, use either --live or --kernel/--config/--map"
-		exit 1
+		echo "$0: error: incompatible modes specified, use either --live or --kernel/--config/--map" >&2
+		exit 255
+	fi
+fi
+
+# coreos mode
+if [ "$opt_coreos" = 1 ]; then
+	if ! is_coreos; then
+		_warn "CoreOS mode asked, but we're not under CoreOS!"
+		exit 255
+	fi
+	_warn "CoreOS mode, starting an ephemeral toolbox to launch the script"
+	load_msr
+	load_cpuid
+	mount_debugfs
+	toolbox --ephemeral --bind-ro /dev/cpu:/dev/cpu -- sh -c "dnf install -y binutils curl which && /media/root$PWD/$0 $@ --coreos-within-toolbox"
+	exitcode=$?
+	mount_debugfs
+	unload_cpuid
+	unload_msr
+	exit $exitcode
+else
+	if is_coreos; then
+		_warn "You seem to be running CoreOS, you might want to use the --coreos option for better results"
+		_warn
 	fi
 fi
 
@@ -457,7 +567,8 @@ if [ "$opt_live" = 1 ]; then
 		_warn "To run it as root, you can try the following command: sudo $0"
 		_warn
 	fi
-	_info "Checking for vulnerabilities against live running kernel \033[35m"$(uname -s) $(uname -r) $(uname -v) $(uname -m)"\033[0m"
+	_info "Checking for vulnerabilities against running kernel \033[35m"$(uname -s) $(uname -r) $(uname -v) $(uname -m)"\033[0m"
+	_info "CPU is\033[35m"$(grep '^model name' /proc/cpuinfo | cut -d: -f2 | head -1)"\033[0m"
 
 	# try to find the image of the current running kernel
 	# first, look for the BOOT_IMAGE hint in the kernel cmdline
@@ -467,17 +578,21 @@ if [ "$opt_live" = 1 ]; then
 		# if we have a dedicated /boot partition, our bootloader might have just called it /
 		# so try to prepend /boot and see if we find anything
 		[ -e "/boot/$opt_kernel" ] && opt_kernel="/boot/$opt_kernel"
+		# special case for CoreOS if we're inside the toolbox
+		[ -e "/media/root/boot/$opt_kernel" ] && opt_kernel="/media/root/boot/$opt_kernel"
 		_debug "opt_kernel is now $opt_kernel"
 		# else, the full path is already there (most probably /boot/something)
 	fi
 	# if we didn't find a kernel, default to guessing
 	if [ ! -e "$opt_kernel" ]; then
+		[ -e /boot/vmlinuz             ] && opt_kernel=/boot/vmlinuz
 		[ -e /boot/vmlinuz-linux       ] && opt_kernel=/boot/vmlinuz-linux
 		[ -e /boot/vmlinuz-linux-libre ] && opt_kernel=/boot/vmlinuz-linux-libre
 		[ -e /boot/vmlinuz-$(uname -r) ] && opt_kernel=/boot/vmlinuz-$(uname -r)
 		[ -e /boot/kernel-$( uname -r) ] && opt_kernel=/boot/kernel-$( uname -r)
 		[ -e /boot/bzImage-$(uname -r) ] && opt_kernel=/boot/bzImage-$(uname -r)
 		[ -e /boot/kernel-genkernel-$(uname -m)-$(uname -r) ] && opt_kernel=/boot/kernel-genkernel-$(uname -m)-$(uname -r)
+		[ -e /run/booted-system/kernel ] && opt_kernel=/run/booted-system/kernel
 	fi
 
 	# system.map
@@ -499,10 +614,12 @@ if [ "$opt_live" = 1 ]; then
 else
 	_info "Checking for vulnerabilities against specified kernel"
 fi
+
 if [ -n "$opt_kernel" ]; then
 	_verbose "Will use vmlinux image \033[35m$opt_kernel\033[0m"
 else
 	_verbose "Will use no vmlinux image (accuracy might be reduced)"
+	bad_accuracy=1
 fi
 if [ -n "$dumped_config" ]; then
 	_verbose "Will use kconfig \033[35m/proc/config.gz\033[0m"
@@ -510,20 +627,28 @@ elif [ -n "$opt_config" ]; then
 	_verbose "Will use kconfig \033[35m$opt_config\033[0m"
 else
 	_verbose "Will use no kconfig (accuracy might be reduced)"
+	bad_accuracy=1
 fi
 if [ -n "$opt_map" ]; then
 	_verbose "Will use System.map file \033[35m$opt_map\033[0m"
 else
 	_verbose "Will use no System.map file (accuracy might be reduced)"
+	bad_accuracy=1
+fi
+
+if [ "$bad_accuracy" = 1 ]; then
+	_info "We're missing some kernel info (see -v), accuracy might be reduced"
 fi
 
 if [ -e "$opt_kernel" ]; then
 	if ! which readelf >/dev/null 2>&1; then
+		_debug "readelf not found"
 		vmlinux_err="missing 'readelf' tool, please install it, usually it's in the 'binutils' package"
 	else
 		extract_vmlinux "$opt_kernel"
 	fi
 else
+	_debug "no opt_kernel defined"
 	vmlinux_err="couldn't find your kernel image in /boot, if you used netboot, this is normal"
 fi
 if [ -z "$vmlinux" -o ! -r "$vmlinux" ]; then
@@ -537,26 +662,10 @@ _info
 # now we define some util functions and the check_*() funcs, as
 # the user can choose to execute only some of those
 
-mount_debugfs()
-{
-	if [ ! -e /sys/kernel/debug/sched_features ]; then
-		# try to mount the debugfs hierarchy ourselves and remember it to umount afterwards
-		mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null && mounted_debugfs=1
-	fi
-}
-
-umount_debugfs()
-{
-	if [ "$mounted_debugfs" = 1 ]; then
-		# umount debugfs if we did mount it ourselves
-		umount /sys/kernel/debug
-	fi
-}
-
 sys_interface_check()
 {
 	[ "$opt_live" = 1 -a "$opt_no_sysfs" = 0 -a -r "$1" ] || return 1
-	_info_nol "* Checking wheter we're safe according to the /sys interface: "
+	_info_nol "* Checking whether we're safe according to the /sys interface: "
 	if grep -qi '^not affected' "$1"; then
 		# Not affected
 		status=OK
@@ -574,6 +683,7 @@ sys_interface_check()
 		pstatus yellow UNKNOWN "unknown value reported by kernel"
 	fi
 	msg=$(cat "$1")
+	_debug "sys_interface_check: $1=$msg"
 	return 0
 }
 
@@ -602,7 +712,7 @@ check_variant1()
 				status=UNK
 				pstatus yellow UNKNOWN
 			else
-				# here we disassemble the kernel and count the number of occurences of the LFENCE opcode
+				# here we disassemble the kernel and count the number of occurrences of the LFENCE opcode
 				# in non-patched kernels, this has been empirically determined as being around 40-50
 				# in patched kernels, this is more around 70-80, sometimes way higher (100+)
 				# v0.13: 68 found in a 3.10.23-xxxx-std-ipv6-64 (with lots of modules compiled-in directly), which doesn't have the LFENCE patches,
@@ -646,10 +756,11 @@ check_variant2()
 		sys_interface_available=1
 	else
 		_info "* Mitigation 1"
-		_info_nol "*   Hardware (CPU microcode) support for mitigation: "
+		_info "*   Hardware (CPU microcode) support for mitigation"
+		_info_nol "*     The SPEC_CTRL MSR is available: "
 		if [ ! -e /dev/cpu/0/msr ]; then
 			# try to load the module ourselves (and remember it so we can rmmod it afterwards)
-			modprobe msr 2>/dev/null && insmod_msr=1
+			load_msr
 		fi
 		if [ ! -e /dev/cpu/0/msr ]; then
 			pstatus yellow UNKNOWN "couldn't read /dev/cpu/0/msr, is msr support enabled in your kernel?"
@@ -665,9 +776,49 @@ check_variant2()
 			fi
 		fi
 
-		if [ "$insmod_msr" = 1 ]; then
-			# if we used modprobe ourselves, rmmod the module
-			rmmod msr 2>/dev/null
+		unload_msr
+
+		# CPUID test
+		_info_nol "*     The SPEC_CTRL CPUID feature bit is set: "
+		if [ ! -e /dev/cpu/0/cpuid ]; then
+			# try to load the module ourselves (and remember it so we can rmmod it afterwards)
+			load_cpuid
+		fi
+		if [ ! -e /dev/cpu/0/cpuid ]; then
+			pstatus yellow UNKNOWN "couldn't read /dev/cpu/0/cpuidr, is cpuid support enabled in your kernel?"
+		else
+			# from kernel src: { X86_FEATURE_SPEC_CTRL,        CPUID_EDX,26, 0x00000007, 0 },
+			if [ "$opt_verbose" -ge 3 ]; then
+				dd if=/dev/cpu/0/cpuid bs=16 skip=7 iflag=skip_bytes count=1 >/dev/null 2>/dev/null
+				_debug "cpuid: reading leaf7 of cpuid on cpu0, ret=$?"
+				_debug "cpuid: leaf7 eax-ebx-ecd-edx: "$(dd if=/dev/cpu/0/cpuid bs=16 skip=7 iflag=skip_bytes count=1 2>/dev/null | od -x -A n)
+				_debug "cpuid: leaf7 edx higher-half is: "$(dd if=/dev/cpu/0/cpuid bs=16 skip=7 iflag=skip_bytes count=1 2>/dev/null | dd bs=1 skip=15 count=1 2>/dev/null | od -x -A n)
+			fi
+			# getting high byte of edx on leaf7 of cpuinfo in decimal
+			edx_hb=$(dd if=/dev/cpu/0/cpuid bs=16 skip=7 iflag=skip_bytes count=1 2>/dev/null | dd bs=1 skip=15 count=1 2>/dev/null | od -t u -A n | awk '{print $1}')
+			_debug "cpuid: leaf7 edx higher byte: $edx_hb (decimal)"
+			edx_bit26=$(( edx_hb & 8 ))
+			_debug "cpuid: edx_bit26=$edx_bit26"
+			if [ "$edx_bit26" -eq 8 ]; then
+				pstatus green YES
+			else
+				pstatus red NO
+			fi
+		fi
+		unload_cpuid
+
+		# hardware support according to kernel
+		if [ "$opt_verbose" -ge 2 ]; then
+			_verbose_nol "*     The kernel has set the spec_ctrl flag in cpuinfo: "
+			if [ "$opt_live" = 1 ]; then
+				if grep ^flags /proc/cpuinfo | grep -qw spec_ctrl; then
+					pstatus green YES
+				else
+					pstatus red NO
+				fi
+			else
+				pstatus blue N/A "not testable in offline mode"
+			fi
 		fi
 
 		_info_nol "*   Kernel support for IBRS: "
@@ -685,14 +836,30 @@ check_variant2()
 					pstatus green YES
 					ibrs_supported=1
 					ibrs_enabled=$(cat "$ibrs_file" 2>/dev/null)
+					_debug "ibrs: found $ibrs_file=$ibrs_enabled"
 					break
+				else
+					_debug "ibrs: file $ibrs_file doesn't exist"
 				fi
 			done
+			# on some newer kernels, the spec_ctrl_ibrs flag in /proc/cpuinfo
+			# is set when ibrs has been administratively enabled (usually from cmdline)
+			# which in that case means ibrs is supported *and* enabled for kernel & user
+			# as per the ibrs patch series v3
+			if [ "$ibrs_supported" = 0 ]; then
+				if grep ^flags /proc/cpuinfo | grep -qw spec_ctrl_ibrs; then
+					_debug "ibrs: found spec_ctrl_ibrs flag in /proc/cpuinfo"
+					ibrs_supported=1
+					# enabled=2 -> kernel & user
+					ibrs_enabled=2
+				fi
+			fi
 		fi
 		if [ "$ibrs_supported" != 1 -a -n "$opt_map" ]; then
 			if grep -q spec_ctrl "$opt_map"; then
 				pstatus green YES
 				ibrs_supported=1
+				_debug "ibrs: found '*spec_ctrl*' symbol in $opt_map"
 			fi
 		fi
 		if [ "$ibrs_supported" != 1 ]; then
@@ -733,6 +900,7 @@ check_variant2()
 			if grep -q '^CONFIG_RETPOLINE=y' "$opt_config"; then
 				pstatus green YES
 				retpoline=1
+				_debug "retpoline: found "$(grep '^CONFIG_RETPOLINE' "$opt_config")" in $opt_config"
 			else
 				pstatus red NO
 			fi
@@ -822,6 +990,7 @@ check_variant3()
 		if [ -n "$opt_config" ]; then
 			kpti_can_tell=1
 			if grep -Eq '^(CONFIG_PAGE_TABLE_ISOLATION|CONFIG_KAISER)=y' "$opt_config"; then
+				_debug "kpti_support: found option "$(grep -E '^(CONFIG_PAGE_TABLE_ISOLATION|CONFIG_KAISER)=y' "$opt_config")" in $opt_config"
 				kpti_support=1
 			fi
 		fi
@@ -830,6 +999,7 @@ check_variant3()
 			# so we try to find an exported symbol that is part of the PTI patch in System.map
 			kpti_can_tell=1
 			if grep -qw kpti_force_enabled "$opt_map"; then
+				_debug "kpti_support: found kpti_force_enabled in $opt_map"
 				kpti_support=1
 			fi
 		fi
@@ -841,6 +1011,7 @@ check_variant3()
 				pstatus yellow UNKNOWN "missing 'strings' tool, please install it, usually it's in the binutils package"
 			else
 				if strings "$vmlinux" | grep -qw nopti; then
+					_debug "kpti_support: found nopti string in $vmlinux"
 					kpti_support=1
 				fi
 			fi
@@ -862,20 +1033,30 @@ check_variant3()
 			dmesg_grep="$dmesg_grep|x86/pti: Unmapping kernel while in userspace"
 			if grep ^flags /proc/cpuinfo | grep -qw pti; then
 				# vanilla PTI patch sets the 'pti' flag in cpuinfo
+				_debug "kpti_enabled: found 'pti' flag in /proc/cpuinfo"
 				kpti_enabled=1
 			elif grep ^flags /proc/cpuinfo | grep -qw kaiser; then
 				# kernel line 4.9 sets the 'kaiser' flag in cpuinfo
+				_debug "kpti_enabled: found 'kaiser' flag in /proc/cpuinfo"
 				kpti_enabled=1
 			elif [ -e /sys/kernel/debug/x86/pti_enabled ]; then
 				# RedHat Backport creates a dedicated file, see https://access.redhat.com/articles/3311301
 				kpti_enabled=$(cat /sys/kernel/debug/x86/pti_enabled 2>/dev/null)
+				_debug "kpti_enabled: file /sys/kernel/debug/x86/pti_enabled exists and says: $kpti_enabled"
 			elif dmesg | grep -Eq "$dmesg_grep"; then
 				# if we can't find the flag, grep dmesg output
+				_debug "kpti_enabled: found hint in dmesg: "$(dmesg | grep -E "$dmesg_grep")
 				kpti_enabled=1
 			elif [ -r /var/log/dmesg ] && grep -Eq "$dmesg_grep" /var/log/dmesg; then
 				# if we can't find the flag in dmesg output, grep in /var/log/dmesg when readable
+				_debug "kpti_enabled: found hint in /var/log/dmesg: "$(grep -E "$dmesg_grep" /var/log/dmesg)
+				kpti_enabled=1
+			elif [ -r /var/log/kern.log ] && grep -Eq "$dmesg_grep" /var/log/kern.log; then
+				# if we can't find the flag in dmesg output, grep in /var/log/kern.log when readable
+				_debug "kpti_enabled: found hint in /var/log/kern.log: "$(grep -E "$dmesg_grep" /var/log/kern.log)
 				kpti_enabled=1
 			else
+				_debug "kpti_enabled: couldn't find any hint that PTI is enabled"
 				kpti_enabled=0
 			fi
 			if [ "$kpti_enabled" = 1 ]; then
@@ -885,6 +1066,50 @@ check_variant3()
 			fi
 		else
 			pstatus blue N/A "can't verify if PTI is enabled in offline mode"
+		fi
+
+		# no security impact but give a hint to the user in verbose mode
+		# about PCID/INVPCID cpuid features that must be present to avoid
+		# too big a performance impact with PTI
+		# refs:
+		# https://marc.info/?t=151532047900001&r=1&w=2
+		# https://groups.google.com/forum/m/#!topic/mechanical-sympathy/L9mHTbeQLNU
+		if [ "$opt_verbose" -ge 2 ]; then
+			_info "* Performance impact if PTI is enabled"
+			_info_nol "*   CPU supports PCID: "
+			if grep ^flags /proc/cpuinfo | grep -qw pcid; then
+				pstatus green YES 'performance degradation with PTI will be limited'
+			else
+				pstatus blue NO 'no security impact but performance will be degraded with PTI'
+			fi
+			_info_nol "*   CPU supports INVPCID: "
+			if grep ^flags /proc/cpuinfo | grep -qw invpcid; then
+				pstatus green YES 'performance degradation with PTI will be limited'
+			else
+				pstatus blue NO 'no security impact but performance will be degraded with PTI'
+			fi
+		fi
+
+		if [ "$opt_live" = 1 ]; then
+			# checking whether we're running under Xen PV 64 bits. If yes, we're not affected by variant3
+			_info_nol "* Checking if we're running under Xen PV (64 bits): "
+			if [ "$(uname -m)" = "x86_64" ]; then
+				# XXX do we have a better way that relying on dmesg?
+				if dmesg | grep -q 'Booting paravirtualized kernel on Xen$' ; then
+					pstatus green YES 'Xen PV is not vulnerable'
+					xen_pv=1
+				elif [ -r /var/log/dmesg ] && grep -q 'Booting paravirtualized kernel on Xen$' /var/log/dmesg; then
+					pstatus green YES 'Xen PV is not vulnerable'
+					xen_pv=1
+				elif [ -r /var/log/kern.log ] && grep -q 'Booting paravirtualized kernel on Xen$' /var/log/kern.log; then
+					pstatus green YES 'Xen PV is not vulnerable'
+					xen_pv=1
+				else
+					pstatus blue NO
+				fi
+			else
+				pstatus blue NO
+			fi
 		fi
 	fi
 
@@ -898,6 +1123,8 @@ check_variant3()
 		if [ "$opt_live" = 1 ]; then
 			if [ "$kpti_enabled" = 1 ]; then
 				pvulnstatus $cve OK "PTI mitigates the vulnerability"
+			elif [ "$xen_pv" = 1 ]; then
+				pvulnstatus $cve OK "Xen PV 64 bits is not vulnerable"
 			else
 				pvulnstatus $cve VULN "PTI is needed to mitigate the vulnerability"
 			fi
@@ -941,11 +1168,13 @@ if [ "$opt_batch" = 1 -a "$opt_batch_format" = "nrpe" ]; then
 	else
 		echo "OK"
 	fi
-	[ "$nrpe_critical" = 1 ] && exit 2  # critical
-	[ "$nrpe_unknown" = 1 ] && exit 3  # unknown
-	exit 0  # ok
 fi
 
 if [ "$opt_batch" = 1 -a "$opt_batch_format" = "json" ]; then
-	_echo 0 ${json_output%?}]
+	_echo 0 ${json_output%?}']'
 fi
+
+# exit with the proper exit code
+[ "$global_critical" = 1 ] && exit 2  # critical
+[ "$global_unknown"  = 1 ] && exit 3  # unknown
+exit 0  # ok
